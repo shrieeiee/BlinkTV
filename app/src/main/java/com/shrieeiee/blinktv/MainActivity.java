@@ -22,15 +22,13 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 
-import org.json.JSONObject;
-
 import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends Activity {
 
     private static final int COLUMNS = 3;
-    private static final long THUMB_REFRESH_MS = 90_000;
+    private static final long REFRESH_MS = 120_000;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -48,13 +46,13 @@ public class MainActivity extends Activity {
     private int loadGeneration = 0;
     private int lastOpened = 0;
     private boolean resumed = false;
-    private AlertDialog settingsDialog;
+    private AlertDialog dialog;
 
-    private final Runnable thumbTick = new Runnable() {
+    private final Runnable refreshTick = new Runnable() {
         @Override public void run() {
             if (!resumed) return;
             if (!cameras.isEmpty()) refreshCameras(false);
-            ui.postDelayed(this, THUMB_REFRESH_MS);
+            ui.postDelayed(this, REFRESH_MS);
         }
     };
 
@@ -72,38 +70,34 @@ public class MainActivity extends Activity {
         messageAction = findViewById(R.id.message_action);
 
         findViewById(R.id.btn_refresh).setOnClickListener(v -> load());
-        findViewById(R.id.btn_settings).setOnClickListener(v -> showSettings(false));
+        findViewById(R.id.btn_settings).setOnClickListener(v -> showSettings());
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         resumed = true;
-        if (!Bridge.configured(this)) {
-            showMessage(false, "Set up the bridge",
-                    "Blink Live talks to a small bridge running on a computer on your network "
-                            + "(the blink-live Docker container). Enter its address to get going.",
-                    "Enter bridge address", () -> showSettings(true));
-            showSettings(true);
+        if (!BlinkApi.signedIn(this)) {
+            showSignedOut(null);
             return;
         }
         if (cameras.isEmpty()) load(); else refreshCameras(false);
-        ui.removeCallbacks(thumbTick);
-        ui.postDelayed(thumbTick, THUMB_REFRESH_MS);
+        ui.removeCallbacks(refreshTick);
+        ui.postDelayed(refreshTick, REFRESH_MS);
     }
 
     @Override
     protected void onPause() {
         super.onPause();
         resumed = false;
-        ui.removeCallbacks(thumbTick);
+        ui.removeCallbacks(refreshTick);
     }
 
     @Override
     public boolean onKeyDown(int keyCode, KeyEvent event) {
         if (keyCode == KeyEvent.KEYCODE_MENU || keyCode == KeyEvent.KEYCODE_PROG_RED
                 || keyCode == KeyEvent.KEYCODE_SETTINGS) {
-            showSettings(false);
+            showSettings();
             return true;
         }
         return super.onKeyDown(keyCode, event);
@@ -112,54 +106,41 @@ public class MainActivity extends Activity {
     // ------------------------------------------------------------------ loading
 
     private void load() {
-        if (!Bridge.configured(this)) { showSettings(true); return; }
-        showMessage(true, "Connecting…", Bridge.url(this), null, null);
+        if (!BlinkApi.signedIn(this)) { showSignedOut(null); return; }
+        showMessage(true, "Loading cameras…", "Asking Blink what you've got.", null, null);
         status.setText("");
         refreshCameras(true);
     }
 
-    /** @param fullReload rebuild the grid; otherwise just refresh metadata + thumbnails in place. */
+    /** @param fullReload rebuild the grid; otherwise refresh metadata + thumbnails in place. */
     private void refreshCameras(final boolean fullReload) {
         final int gen = ++loadGeneration;
-        Bridge.IO.execute(() -> {
+        BlinkApi.IO.execute(() -> {
             try {
-                JSONObject health = Bridge.get(this, "/api/health", 8000);
-                JSONObject blink = health.optJSONObject("blink");
-                boolean ready = blink != null && blink.optBoolean("ready", false);
-                if (!ready) {
-                    String err = blink == null ? "" : blink.optString("last_error", "");
-                    ui.post(() -> { if (gen == loadGeneration) showNotLinked(err); });
-                    return;
-                }
-                final List<Camera> list = Camera.listFrom(Bridge.get(this, "/api/cameras", 15000));
-                final String account = blink.optString("account", "");
+                final List<Camera> list = BlinkApi.cameras(this);
                 ui.post(() -> {
                     if (gen != loadGeneration) return;
+                    String email = BlinkApi.accountEmail(this);
                     status.setText(list.size() + (list.size() == 1 ? " camera" : " cameras")
-                            + (account.isEmpty() || "null".equals(account) ? "" : "  ·  " + account)
-                            + "  ·  " + Bridge.url(this).replaceFirst("^https?://", ""));
+                            + (email.isEmpty() ? "" : "  ·  " + email));
                     if (list.isEmpty()) {
                         showMessage(false, "No cameras on this Blink account",
-                                "The bridge is linked but Blink didn't return any cameras.", "Check again", this::load);
+                                "You're signed in but Blink didn't return any cameras.", "Check again", this::load);
                         return;
                     }
                     if (fullReload || !sameIds(list)) renderGrid(list); else updateGrid(list);
-                    loadThumbnails(gen);
+                    loadThumbnails();
                 });
-            } catch (Bridge.BridgeException e) {
+            } catch (BlinkApi.NotSignedInException e) {
+                ui.post(() -> { if (gen == loadGeneration) showSignedOut(e.getMessage()); });
+            } catch (BlinkApi.BlinkException e) {
                 final String msg = e.getMessage();
                 ui.post(() -> {
                     if (gen != loadGeneration) return;
-                    if (e.status == 401) {
-                        showMessage(false, "Bridge wants a token",
-                                "This bridge has BRIDGE_TOKEN set. Put the same value in Settings.",
-                                "Open settings", () -> showSettings(false));
-                    } else if (fullReload || cameras.isEmpty()) {
-                        showMessage(false, "Bridge offline", msg
-                                        + "\n\nCheck the blink-live container is running and the TV is on the same network.",
-                                "Try again", this::load);
+                    if (fullReload || cameras.isEmpty()) {
+                        showMessage(false, "Can't reach Blink", msg, "Try again", this::load);
                     } else {
-                        status.setText("Bridge offline — showing last known cameras");
+                        status.setText("Couldn't refresh — showing last known cameras");
                     }
                 });
             }
@@ -172,13 +153,16 @@ public class MainActivity extends Activity {
         return true;
     }
 
-    private void showNotLinked(String lastError) {
-        String setup = Bridge.url(this) + "/setup";
-        showMessage(false, "Link your Blink account",
-                "On your phone or PC, open\n\n" + setup + "\n\nsign in with your Blink account and enter the code Blink emails you. "
-                        + "You only have to do this once."
-                        + (lastError == null || lastError.isEmpty() || "null".equals(lastError) ? "" : "\n\nLast error: " + lastError),
-                "I've done it — check again", this::load);
+    private void showSignedOut(String why) {
+        cameras.clear();
+        cards.clear();
+        grid.removeAllViews();
+        status.setText("");
+        showMessage(false, "Sign in to Blink",
+                (why == null ? "" : why + "\n\n")
+                        + "Use the same email and password as the Blink phone app. Blink will email you a code to finish.\n"
+                        + "Tip: the Google TV app on your phone makes typing this a lot less painful.",
+                "Sign in", this::showLogin);
     }
 
     private void showMessage(boolean spinner, String title, String body, String action, Runnable onAction) {
@@ -238,7 +222,6 @@ public class MainActivity extends Activity {
             cards.add(card);
             bindCard(card, cameras.get(i), i);
         }
-        // Fill the last row so cards keep their width alignment.
         int focus = Math.min(lastOpened, cards.size() - 1);
         if (focus >= 0) cards.get(focus).requestFocus();
     }
@@ -270,12 +253,12 @@ public class MainActivity extends Activity {
         card.setContentDescription(cam.name + (cam.online ? "" : ", offline"));
     }
 
-    private void loadThumbnails(final int gen) {
-        for (int i = 0; i < cameras.size(); i++) {
+    private void loadThumbnails() {
+        for (int i = 0; i < cameras.size() && i < cards.size(); i++) {
             final Camera cam = cameras.get(i);
             final View card = cards.get(i);
-            Bridge.IO.execute(() -> {
-                byte[] data = Bridge.bytes(this, cam.thumbnailPath + "?rev=" + Bridge.enc(cam.thumbnailRev), 20000);
+            BlinkApi.IO.execute(() -> {
+                byte[] data = BlinkApi.thumbnail(this, cam);
                 if (data == null) return;
                 final Bitmap bmp = BitmapFactory.decodeByteArray(data, 0, data.length);
                 if (bmp == null) return;
@@ -290,15 +273,8 @@ public class MainActivity extends Activity {
 
     private void openLive(int index) {
         lastOpened = index;
-        String[] ids = new String[cameras.size()];
-        String[] names = new String[cameras.size()];
-        for (int i = 0; i < cameras.size(); i++) {
-            ids[i] = cameras.get(i).id;
-            names[i] = cameras.get(i).name;
-        }
         Intent intent = new Intent(this, LiveActivity.class)
-                .putExtra(LiveActivity.EXTRA_IDS, ids)
-                .putExtra(LiveActivity.EXTRA_NAMES, names)
+                .putExtra(LiveActivity.EXTRA_CAMERAS, Camera.listToJson(cameras))
                 .putExtra(LiveActivity.EXTRA_INDEX, index);
         startActivityForResult(intent, 1);
     }
@@ -310,24 +286,96 @@ public class MainActivity extends Activity {
         if (lastOpened >= 0 && lastOpened < cards.size()) cards.get(lastOpened).requestFocus();
     }
 
+    // ------------------------------------------------------------------ sign in
+
+    private void showLogin() {
+        if (dialog != null && dialog.isShowing()) return;
+        LinearLayout box = form();
+        box.addView(label("Blink email"));
+        final EditText email = field(BlinkApi.accountEmail(this), "you@example.com",
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+        box.addView(email);
+        box.addView(label("Blink password"));
+        final EditText password = field("", "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        password.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        box.addView(password);
+        box.addView(label("Your password is only sent to Blink and isn't stored on the TV."));
+
+        dialog = new AlertDialog.Builder(this, R.style.Dialog_BlinkTV)
+                .setTitle("Sign in to Blink")
+                .setView(box)
+                .setPositiveButton("Sign in", (d, w) -> doLogin(email.getText().toString(), password.getText().toString()))
+                .setNegativeButton("Cancel", null)
+                .create();
+        email.setOnEditorActionListener((v, id, ev) -> { password.requestFocus(); return true; });
+        dialog.show();
+        (email.getText().length() == 0 ? email : password).requestFocus();
+    }
+
+    private void doLogin(String email, String password) {
+        if (email.trim().isEmpty() || password.isEmpty()) {
+            showSignedOut("Need both an email and a password.");
+            return;
+        }
+        showMessage(true, "Signing in…", "Talking to Blink.", null, null);
+        BlinkApi.IO.execute(() -> {
+            try {
+                BlinkApi.LoginResult r = BlinkApi.login(this, email, password);
+                ui.post(() -> {
+                    if (r == BlinkApi.LoginResult.NEED_CODE) showCodeEntry(null); else load();
+                });
+            } catch (BlinkApi.BlinkException e) {
+                final String msg = e.getMessage();
+                ui.post(() -> showMessage(false, "Sign-in didn't work", msg, "Try again", this::showLogin));
+            }
+        });
+    }
+
+    private void showCodeEntry(String error) {
+        showMessage(false, "Check your email",
+                "Blink has emailed you a code." + (error == null ? "" : "\n\n" + error),
+                "Enter the code", () -> showCodeEntry(null));
+        if (dialog != null && dialog.isShowing()) return;
+        LinearLayout box = form();
+        box.addView(label("Code from Blink's email"));
+        final EditText code = field("", "123456", InputType.TYPE_CLASS_NUMBER);
+        code.setImeOptions(EditorInfo.IME_ACTION_DONE);
+        box.addView(code);
+        dialog = new AlertDialog.Builder(this, R.style.Dialog_BlinkTV)
+                .setTitle("Enter Blink's code")
+                .setView(box)
+                .setPositiveButton("Verify", (d, w) -> doVerify(code.getText().toString()))
+                .setNegativeButton("Start again", (d, w) -> showLogin())
+                .create();
+        dialog.show();
+        code.requestFocus();
+    }
+
+    private void doVerify(String code) {
+        if (code.trim().isEmpty()) { showCodeEntry("The code was empty."); return; }
+        showMessage(true, "Checking the code…", "", null, null);
+        BlinkApi.IO.execute(() -> {
+            try {
+                BlinkApi.verifyCode(this, code);
+                ui.post(this::load);
+            } catch (BlinkApi.BlinkException e) {
+                final String msg = e.getMessage();
+                ui.post(() -> showCodeEntry(msg));
+            }
+        });
+    }
+
     // ------------------------------------------------------------------ settings
 
-    private void showSettings(final boolean firstRun) {
-        if (settingsDialog != null && settingsDialog.isShowing()) return;
+    private void showSettings() {
+        if (dialog != null && dialog.isShowing()) return;
+        LinearLayout box = form();
+        String email = BlinkApi.accountEmail(this);
+        box.addView(label(BlinkApi.signedIn(this)
+                ? "Signed in" + (email.isEmpty() ? "" : " as " + email)
+                : "Not signed in"));
 
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(28), dp(12), dp(28), dp(4));
-
-        box.addView(label("Bridge address  (e.g. 192.168.0.50 — port 8099 is added for you)"));
-        final EditText url = field(Bridge.url(this), "192.168.0.x", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        box.addView(url);
-
-        box.addView(label("Bridge token  (leave blank unless you set BRIDGE_TOKEN)"));
-        final EditText token = field(Bridge.token(this), "optional", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
-        box.addView(token);
-
-        final int[] track = {Bridge.audioTrack(this)};
+        final int[] track = {BlinkApi.audioTrack(this)};
         box.addView(label("Camera microphone channel (only matters if a camera is silent)"));
         final Button audio = new Button(this, null, 0, R.style.TvButton);
         audio.setText("Audio channel " + (track[0] + 1));
@@ -335,35 +383,33 @@ public class MainActivity extends Activity {
             track[0] = track[0] == 0 ? 1 : 0;
             audio.setText("Audio channel " + (track[0] + 1));
         });
-        LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(48));
+        LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(48));
         ap.topMargin = dp(6);
         box.addView(audio, ap);
 
         AlertDialog.Builder b = new AlertDialog.Builder(this, R.style.Dialog_BlinkTV)
-                .setTitle(firstRun ? "Where's your blink-live bridge?" : "Settings")
+                .setTitle("Settings")
                 .setView(box)
-                .setPositiveButton("Save", (d, w) -> {
-                    String u = url.getText().toString();
-                    if (Bridge.normaliseUrl(u).isEmpty()) return;
-                    Bridge.save(this, u, token.getText().toString(), track[0]);
-                    cameras.clear();
-                    load();
-                })
+                .setPositiveButton("Save", (d, w) -> BlinkApi.setAudioTrack(this, track[0]))
                 .setNegativeButton("Cancel", null);
-        if (!firstRun && Bridge.configured(this)) {
-            b.setNeutralButton("Re-link Blink", (d, w) -> showNotLinked(null));
+        if (BlinkApi.signedIn(this)) {
+            b.setNeutralButton("Sign out", (d, w) -> {
+                BlinkApi.signOut(this);
+                showSignedOut(null);
+            });
         }
-        settingsDialog = b.create();
-        url.setOnEditorActionListener((v, actionId, ev) -> {
-            if (actionId == EditorInfo.IME_ACTION_NEXT || actionId == EditorInfo.IME_ACTION_DONE) {
-                token.requestFocus();
-                return true;
-            }
-            return false;
-        });
-        settingsDialog.show();
-        url.requestFocus();
+        dialog = b.create();
+        dialog.show();
+        audio.requestFocus();
+    }
+
+    // ------------------------------------------------------------------ bits
+
+    private LinearLayout form() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(28), dp(12), dp(28), dp(4));
+        return box;
     }
 
     private TextView label(String s) {

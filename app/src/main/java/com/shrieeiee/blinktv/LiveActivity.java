@@ -1,11 +1,13 @@
 package com.shrieeiee.blinktv;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.widget.TextView;
@@ -23,16 +25,12 @@ import androidx.media3.common.util.UnstableApi;
 import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.ExoPlayer;
-import androidx.media3.exoplayer.hls.DefaultHlsExtractorFactory;
-import androidx.media3.exoplayer.hls.HlsMediaSource;
-import androidx.media3.exoplayer.source.MediaSource;
 import androidx.media3.exoplayer.source.ProgressiveMediaSource;
 import androidx.media3.extractor.DefaultExtractorsFactory;
 import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory;
 import androidx.media3.ui.AspectRatioFrameLayout;
 import androidx.media3.ui.PlayerView;
 
-import org.json.JSONException;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
@@ -40,45 +38,40 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Full-screen live view. Asks the bridge for a raw MPEG-TS relay first (lowest latency),
- * falls back to HLS if the TV's decoder chokes, and quietly reconnects when Blink
- * cuts the live view at ~5 minutes.
+ * Full-screen live view straight from Blink: asks Blink to start a live view, opens the
+ * IMMIS relay ({@link ImmisStream}) and plays the MPEG-TS it unwraps. Reconnects quietly
+ * when Blink cuts the live view at ~5 minutes.
  */
 @OptIn(markerClass = UnstableApi.class)
 public class LiveActivity extends Activity {
 
-    public static final String EXTRA_IDS = "ids";
-    public static final String EXTRA_NAMES = "names";
+    public static final String EXTRA_CAMERAS = "cameras";
     public static final String EXTRA_INDEX = "index";
 
-    private static final String PROTO_TS = "ts";
-    private static final String PROTO_HLS = "hls";
+    private static final String TAG = "BlinkLive";
     private static final long OVERLAY_MS = 5000;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
 
-    private String[] ids;
-    private String[] names;
+    private List<Camera> cams = new ArrayList<>();
     private int index;
 
     private PlayerView playerView;
     private ExoPlayer player;
     private DefaultHttpDataSource.Factory http;
+    private ImmisStream stream;
 
     private View topBar, hint, loader, errorBox;
     private TextView livePill, camName, timer, loaderTitle, loaderBody, errorBody;
 
     /** Bumped on every (re)start; stale async results compare against it and bail. */
     private int generation = 0;
-    private String protocol = PROTO_TS;
-    private boolean hlsTried = false;
     private boolean isLive = false;
     private boolean audioOverrideDone = false;
     private boolean started = false;
     private long sessionStartedAt = 0;
     private long liveSince = 0;
     private int quickFailures = 0;
-    private String activeCameraId = null;
 
     private final Runnable hideOverlay = () -> setOverlayVisible(false);
 
@@ -99,16 +92,11 @@ public class LiveActivity extends Activity {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_live);
 
-        ids = getIntent().getStringArrayExtra(EXTRA_IDS);
-        names = getIntent().getStringArrayExtra(EXTRA_NAMES);
+        cams = Camera.listFromJson(getIntent().getStringExtra(EXTRA_CAMERAS));
         index = getIntent().getIntExtra(EXTRA_INDEX, 0);
-        if (ids == null || ids.length == 0) { finish(); return; }
-        if (names == null || names.length != ids.length) names = ids;
+        if (cams.isEmpty()) { finish(); return; }
         if (savedInstanceState != null) index = savedInstanceState.getInt(EXTRA_INDEX, index);
-        index = Math.max(0, Math.min(index, ids.length - 1));
-
-        // If this TV already proved it can't do raw TS, go straight to HLS.
-        if (getSharedPreferences("player", MODE_PRIVATE).getBoolean("prefer_hls", false)) protocol = PROTO_HLS;
+        index = Math.max(0, Math.min(index, cams.size() - 1));
 
         playerView = findViewById(R.id.player_view);
         playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
@@ -123,11 +111,11 @@ public class LiveActivity extends Activity {
         loaderBody = findViewById(R.id.loader_body);
         errorBody = findViewById(R.id.error_body);
 
+        // Only ever talks to our own loopback server.
         http = new DefaultHttpDataSource.Factory()
-                .setUserAgent("BlinkTV/1.0 (Android TV)")
-                .setConnectTimeoutMs(15000)
-                .setReadTimeoutMs(30000)
-                .setAllowCrossProtocolRedirects(true);
+                .setUserAgent("BlinkTV/1.0")
+                .setConnectTimeoutMs(5000)
+                .setReadTimeoutMs(30000);
     }
 
     @Override
@@ -139,7 +127,7 @@ public class LiveActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
-        if (ids == null || ids.length == 0) return;
+        if (cams.isEmpty()) return;
         started = true;
         ui.post(tick);
         startStream(false);
@@ -153,94 +141,86 @@ public class LiveActivity extends Activity {
         ui.removeCallbacksAndMessages(null);
         releasePlayer();
         // Give Blink's single live slot back so the phone app / doorbell can use it.
-        if (activeCameraId != null) Bridge.stopLive(this, activeCameraId);
-        activeCameraId = null;
+        if (stream != null) stream.stop();
+        stream = null;
     }
 
     // ------------------------------------------------------------------ stream lifecycle
 
     private void startStream(final boolean reconnect) {
         final int gen = ++generation;
-        final String cameraId = ids[index];
-        final String previous = activeCameraId;
-        final String proto = protocol;
-        activeCameraId = cameraId;
+        final Camera cam = cams.get(index);
+        final ImmisStream previous = stream;
+        stream = null;
         isLive = false;
         liveSince = 0;
         audioOverrideDone = false;
         sessionStartedAt = SystemClock.elapsedRealtime();
 
         if (player != null) player.stop();
-        playerView.setVisibility(View.VISIBLE);
         errorBox.setVisibility(View.GONE);
-        camName.setText(names[index]);
+        camName.setText(cam.name);
         updateHint();
         setPill(reconnect ? "RECONNECTING" : "WAKING", false);
-        showLoader(reconnect ? "Reconnecting…" : "Waking " + names[index] + "…",
+        showLoader(reconnect ? "Reconnecting…" : "Waking " + cam.name + "…",
                 reconnect
                         ? "Blink ends live views after about five minutes, grabbing a fresh one."
                         : "Battery cameras take a few seconds to wake. Blink only allows one live view at a time, "
                           + "so close it on your phone if it's open.");
         setOverlayVisible(true);
 
-        Bridge.IO.execute(() -> {
-            // Switching camera: free the old one first so Blink doesn't refuse the new one.
-            if (previous != null && !previous.equals(cameraId)) {
-                try {
-                    Bridge.post(this, "/api/live/" + Bridge.enc(previous) + "/stop", null, 8000);
-                } catch (Bridge.BridgeException ignored) { }
-            }
+        final Context app = getApplicationContext();
+        BlinkApi.IO.execute(() -> {
+            // Free the old live view first, or Blink may refuse the next one.
+            if (previous != null) previous.stop(true);
+            if (gen != generation) return;
+            ImmisStream s = null;
             try {
-                JSONObject body = new JSONObject();
-                try { body.put("audio_track", Bridge.audioTrack(this)); } catch (JSONException ignored) { }
-                JSONObject res = Bridge.post(this, "/api/live/" + Bridge.enc(cameraId) + "/" + proto, body, 75000);
-                String path = PROTO_HLS.equals(proto) ? res.optString("playlist_url") : res.optString("stream_url");
-                if (path.isEmpty()) throw new Bridge.BridgeException("Bridge didn't return a stream address.", 500, res);
-                final String url = Bridge.abs(this, path);
-                ui.post(() -> { if (gen == generation && started) play(url, proto); });
-            } catch (Bridge.BridgeException e) {
-                final String msg = e.getMessage();
-                ui.post(() -> {
-                    if (gen != generation || !started) return;
-                    if (PROTO_TS.equals(proto) && !hlsTried && e.status != 0) {
-                        // Bridge is up but TS start failed: try the HLS route before giving up.
-                        switchToHls();
-                        return;
+                JSONObject lv = BlinkApi.startLiveview(app, cam);
+                final long commandId = lv.optLong("command_id", 0);
+                final String network = cam.networkId;
+                s = new ImmisStream(lv.optString("server"), cam.serial, commandId,
+                        lv.optInt("polling_interval", 15), new ImmisStream.Hooks() {
+                    @Override public boolean commandRunning() throws Exception {
+                        return BlinkApi.commandRunning(app, network, commandId);
                     }
-                    showError(msg);
+                    @Override public void commandDone() {
+                        BlinkApi.commandDone(app, network, commandId);
+                    }
+                    @Override public void log(String msg) {
+                        Log.i(TAG, cam.name + ": " + msg);
+                    }
                 });
+                final String url = s.start();
+                final ImmisStream ready = s;
+                ui.post(() -> {
+                    if (gen != generation || !started) { ready.stop(); return; }
+                    stream = ready;
+                    play(url);
+                });
+            } catch (BlinkApi.NotSignedInException e) {
+                if (s != null) s.stop();
+                ui.post(() -> { if (gen == generation && started) showError("Signed out of Blink. Go back and sign in again."); });
+            } catch (Exception e) {
+                if (s != null) s.stop();
+                final String msg = e instanceof BlinkApi.BlinkException ? e.getMessage()
+                        : "Couldn't connect to Blink's live-view server (" + e.getClass().getSimpleName()
+                          + (e.getMessage() == null ? "" : ": " + e.getMessage()) + ").";
+                ui.post(() -> { if (gen == generation && started) showError(msg); });
             }
         });
     }
 
-    private void play(String url, String proto) {
+    private void play(String url) {
         if (player == null) buildPlayer();
-        MediaSource source;
-        if (PROTO_HLS.equals(proto)) {
-            source = new HlsMediaSource.Factory(http)
-                    .setExtractorFactory(new DefaultHlsExtractorFactory(
-                            DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES, true))
-                    .setAllowChunklessPreparation(true)
-                    .createMediaSource(new MediaItem.Builder()
-                            .setUri(url)
-                            .setMimeType(MimeTypes.APPLICATION_M3U8)
-                            .setLiveConfiguration(new MediaItem.LiveConfiguration.Builder()
-                                    .setTargetOffsetMs(2000)
-                                    .setMinPlaybackSpeed(0.97f)
-                                    .setMaxPlaybackSpeed(1.04f)
-                                    .build())
-                            .build());
-        } else {
-            DefaultExtractorsFactory extractors = new DefaultExtractorsFactory()
-                    .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
-                            | DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS);
-            source = new ProgressiveMediaSource.Factory(http, extractors)
-                    .createMediaSource(new MediaItem.Builder()
-                            .setUri(url)
-                            .setMimeType(MimeTypes.VIDEO_MP2T)
-                            .build());
-        }
-        player.setMediaSource(source);
+        DefaultExtractorsFactory extractors = new DefaultExtractorsFactory()
+                .setTsExtractorFlags(DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
+                        | DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS);
+        player.setMediaSource(new ProgressiveMediaSource.Factory(http, extractors)
+                .createMediaSource(new MediaItem.Builder()
+                        .setUri(url)
+                        .setMimeType(MimeTypes.VIDEO_MP2T)
+                        .build()));
         player.prepare();
         player.setPlayWhenReady(true);
     }
@@ -273,9 +253,6 @@ public class LiveActivity extends Activity {
                 if (!isLive) {
                     isLive = true;
                     liveSince = SystemClock.elapsedRealtime();
-                    if (PROTO_HLS.equals(protocol) && hlsTried) {
-                        getSharedPreferences("player", MODE_PRIVATE).edit().putBoolean("prefer_hls", true).apply();
-                    }
                 }
                 hideLoader();
                 setPill("● LIVE", true);
@@ -283,18 +260,13 @@ public class LiveActivity extends Activity {
             } else if (state == Player.STATE_BUFFERING && isLive) {
                 setPill("BUFFERING", false);
             } else if (state == Player.STATE_ENDED) {
-                // Blink's ~5 minute cut, or the bridge's guard. Grab a new session.
+                // Blink's ~5 minute cut (relay closed). Grab a new session.
                 onSessionDropped(null);
             }
         }
 
         @Override
         public void onPlayerError(@NonNull PlaybackException error) {
-            if (PROTO_TS.equals(protocol) && !hlsTried && !isLive) {
-                // Raw TS rejected before a single frame: this TV wants HLS.
-                switchToHls();
-                return;
-            }
             onSessionDropped(error.getErrorCodeName());
         }
 
@@ -304,29 +276,22 @@ public class LiveActivity extends Activity {
         }
     };
 
-    /** Raw TS keeps both Blink mic tracks; honour the chosen channel if there are two. */
+    /** Blink can expose two mic tracks; honour the chosen channel if there are two. */
     private void applyAudioChoice(Tracks tracks) {
-        if (audioOverrideDone || player == null || PROTO_HLS.equals(protocol)) return;
+        if (audioOverrideDone || player == null) return;
         List<Tracks.Group> audio = new ArrayList<>();
         for (Tracks.Group g : tracks.getGroups()) if (g.getType() == C.TRACK_TYPE_AUDIO) audio.add(g);
         if (audio.size() < 2) return;
         audioOverrideDone = true;
-        int want = Math.min(Bridge.audioTrack(this), audio.size() - 1);
+        int want = Math.min(BlinkApi.audioTrack(this), audio.size() - 1);
         player.setTrackSelectionParameters(player.getTrackSelectionParameters().buildUpon()
                 .setOverrideForType(new TrackSelectionOverride(audio.get(want).getMediaTrackGroup(), 0))
                 .build());
     }
 
-    private void switchToHls() {
-        hlsTried = true;
-        protocol = PROTO_HLS;
-        startStream(true);
-    }
-
     private void onSessionDropped(String why) {
         long lasted = SystemClock.elapsedRealtime() - sessionStartedAt;
-        boolean wasLive = isLive;
-        if (wasLive && lasted > 30_000) quickFailures = 0; else quickFailures++;
+        if (isLive && lasted > 30_000) quickFailures = 0; else quickFailures++;
         if (quickFailures >= 3) {
             quickFailures = 0;
             showError("The stream keeps dropping" + (why == null ? "." : " (" + why + ").")
@@ -351,6 +316,7 @@ public class LiveActivity extends Activity {
     private void showError(String msg) {
         isLive = false;
         if (player != null) player.stop();
+        if (stream != null) { stream.stop(); stream = null; }
         hideLoader();
         setPill("OFFLINE", false);
         errorBody.setText(msg == null ? "Unknown error." : msg);
@@ -365,7 +331,7 @@ public class LiveActivity extends Activity {
     }
 
     private void updateHint() {
-        String nav = ids.length > 1 ? "◀ ▶  switch camera (" + (index + 1) + " of " + ids.length + ")      " : "";
+        String nav = cams.size() > 1 ? "◀ ▶  switch camera (" + (index + 1) + " of " + cams.size() + ")      " : "";
         ((TextView) hint).setText(nav + "OK  show/hide info      BACK  camera grid");
     }
 
@@ -388,12 +354,12 @@ public class LiveActivity extends Activity {
             case KeyEvent.KEYCODE_DPAD_LEFT:
             case KeyEvent.KEYCODE_CHANNEL_DOWN:
             case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
-                if (ids.length > 1) { index = (index - 1 + ids.length) % ids.length; restartFresh(); }
+                if (cams.size() > 1) { index = (index - 1 + cams.size()) % cams.size(); restartFresh(); }
                 return true;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
             case KeyEvent.KEYCODE_CHANNEL_UP:
             case KeyEvent.KEYCODE_MEDIA_NEXT:
-                if (ids.length > 1) { index = (index + 1) % ids.length; restartFresh(); }
+                if (cams.size() > 1) { index = (index + 1) % cams.size(); restartFresh(); }
                 return true;
             case KeyEvent.KEYCODE_DPAD_CENTER:
             case KeyEvent.KEYCODE_ENTER:
