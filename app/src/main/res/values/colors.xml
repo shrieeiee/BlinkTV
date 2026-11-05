@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0B0E10</color>
+    <color name="panel">#151A1E</color>
+    <color name="panel_hi">#1E252A</color>
+    <color name="ink">#ECEFF1</color>
+    <color name="ink_dim">#8A959C</color>
+    <color name="accent">#FFB547</color>
+    <color name="live">#FF4D4D</color>
+    <color name="ok">#5BD88A</color>
+    <color name="scrim">#CC000000</color>
+</resources>
